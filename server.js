@@ -218,21 +218,57 @@ app.put("/api/inventario/:id", auth, async (req, res) => {
       precio_unitario,
       stock_inicial,
       stock_minimo,
-      imagen_url,
+      // OJO: no extraigas imagen_url aquí; lo leeremos con hasOwnProperty
     } = req.body || {};
+
     const pool = await getPool();
+
+    // Construye el SET dinámico
+    const sets = [];
+    const vals = [];
+
+    if (nombre_producto !== undefined) {
+      sets.push("nombre_producto=?");
+      vals.push(nombre_producto);
+    }
+    if (categoria !== undefined) {
+      sets.push("categoria=?");
+      vals.push(categoria);
+    }
+    if (precio_unitario !== undefined) {
+      sets.push("precio_unitario=?");
+      vals.push(Number(precio_unitario));
+    }
+    if (stock_inicial !== undefined) {
+      sets.push("stock_inicial=?");
+      vals.push(Number(stock_inicial));
+    }
+    if (stock_minimo !== undefined) {
+      sets.push("stock_minimo=?");
+      vals.push(Number(stock_minimo));
+    }
+
+    // SOLO tocar imagen si el body trae explicitamente la clave imagen_url
+    if (Object.prototype.hasOwnProperty.call(req.body, "imagen_url")) {
+      const img = req.body.imagen_url;
+      if (img === "" || img === null) {
+        sets.push("imagen_url=NULL"); // limpiar imagen a propósito
+      } else {
+        sets.push("imagen_url=?");
+        vals.push(img);
+      }
+    }
+    // Si por algún motivo no vino ningún campo, evita UPDATE vacío
+    if (sets.length === 0) {
+      return res.status(400).json({ ok: false, error: "Nada para actualizar" });
+    }
+
+    vals.push(req.params.id);
     const [r] = await pool.query(
-      "UPDATE inventario SET nombre_producto=?, categoria=?, precio_unitario=?, stock_inicial=?, stock_minimo=?, imagen_url=? WHERE id_producto=?",
-      [
-        nombre_producto,
-        categoria,
-        Number(precio_unitario),
-        Number(stock_inicial),
-        Number(stock_minimo),
-        imagen_url ?? null,
-        req.params.id,
-      ]
+      `UPDATE inventario SET ${sets.join(", ")} WHERE id_producto=?`,
+      vals
     );
+
     if (!r.affectedRows)
       return res.status(404).json({ ok: false, error: "No encontrado" });
 
@@ -679,12 +715,10 @@ app.put("/api/consumo/:id", auth, async (req, res) => {
 
     if (Number(row.id_producto) !== idNum) {
       await conn.rollback();
-      return res
-        .status(400)
-        .json({
-          ok: false,
-          error: "No se permite cambiar el producto en edición",
-        });
+      return res.status(400).json({
+        ok: false,
+        error: "No se permite cambiar el producto en edición",
+      });
     }
 
     const diff = qtyNew - Number(row.cantidad); // si aumenta consumo, diff>0 hay que RESTAR stock adicional
@@ -697,12 +731,10 @@ app.put("/api/consumo/:id", auth, async (req, res) => {
         );
         if (upd.affectedRows === 0) {
           await conn.rollback();
-          return res
-            .status(409)
-            .json({
-              ok: false,
-              error: "Stock insuficiente para aumentar consumo",
-            });
+          return res.status(409).json({
+            ok: false,
+            error: "Stock insuficiente para aumentar consumo",
+          });
         }
       } else {
         // si diff<0, reponer (-diff)
