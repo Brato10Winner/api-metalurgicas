@@ -495,70 +495,294 @@ app.delete("/api/ventas/:id", auth, async (req, res) => {
 // ======================================================
 // =================  CONSUMO TALLER  ===================
 // ======================================================
+
+// GET: lista de consumos con alias tipo VentasLista (y miniatura)
 app.get("/api/consumo", auth, async (req, res) => {
   try {
+    const { desde, hasta, id_producto } = req.query;
+    const cond = [];
+    const vals = [];
+
+    if (desde) {
+      cond.push("v.fecha >= ?");
+      vals.push(desde);
+    }
+    if (hasta) {
+      cond.push("v.fecha <= ?");
+      vals.push(hasta);
+    }
+    if (id_producto) {
+      cond.push("v.id_producto = ?");
+      vals.push(id_producto);
+    }
+
+    let sql = `
+      SELECT
+        v.id,
+        v.fecha,
+        v.id_producto,
+        v.producto AS nombre_producto,
+        v.cantidad AS cantidad_vendida,  -- alias para UI tipo 'VentasLista'
+        v.valor    AS total_venta,       -- alias para UI
+        v.tableros,
+        v.parales,
+        v.venta,
+        i.imagen_url
+      FROM consumo_taller v
+      INNER JOIN inventario i ON i.id_producto = v.id_producto
+    `;
+    if (cond.length) sql += " WHERE " + cond.join(" AND ");
+    sql += " ORDER BY v.fecha DESC, v.id DESC";
+
     const pool = await getPool();
-    const [rows] = await pool.query(
-      "SELECT * FROM consumo_taller ORDER BY fecha DESC, id DESC"
-    );
+    const [rows] = await pool.query(sql, vals);
     res.json({ ok: true, datos: rows });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
+// POST: crear consumo (RESTAR stock en inventario, transaccional)
+// Acepta payload estilo "ventas" (cantidad_vendida/total_venta) o "consumo" (cantidad/valor)
 app.post("/api/consumo", auth, async (req, res) => {
   try {
-    const {
-      fecha,
-      id_producto,
-      cantidad,
-      valor,
-      producto,
-      tableros,
-      parales,
-      venta,
-    } = req.body || {};
-    if (!fecha || !id_producto || !cantidad || valor == null || !producto) {
+    const { fecha, id_producto } = req.body || {};
+    const idNum = Number(id_producto);
+
+    // Normaliza nombres de cantidad/valor desde el body
+    const qtyRaw = req.body.cantidad_vendida ?? req.body.cantidad;
+    const valRaw = req.body.total_venta ?? req.body.valor;
+    const qty = parseNumAny(qtyRaw);
+    const valor = parseNumAny(valRaw);
+
+    // Campos opcionales
+    const tableros =
+      req.body.tableros != null ? Number(req.body.tableros) : null;
+    const parales = req.body.parales != null ? Number(req.body.parales) : null;
+    const venta = req.body.venta != null ? Number(req.body.venta) : null;
+
+    if (
+      !fecha ||
+      !idNum ||
+      Number.isNaN(qty) ||
+      qty <= 0 ||
+      Number.isNaN(valor)
+    ) {
       return res.status(400).json({
         ok: false,
         error:
-          "fecha, id_producto, producto, cantidad y valor son obligatorios",
+          "fecha, id_producto, cantidad y valor (o total_venta) son obligatorios/válidos",
       });
     }
+
     const pool = await getPool();
-    // (NOTA) Aquí NO tocamos inventario: si quieres que consumo también descuente,
-    // aplica la MISMA estrategia con transacción que en ventas.
-    await pool.query(
-      "INSERT INTO consumo_taller (fecha, id_producto, producto, cantidad, valor, tableros, parales, venta) VALUES (?,?,?,?,?,?,?,?)",
-      [
-        fecha,
-        id_producto,
-        Number(cantidad),
-        Number(valor),
-        producto,
-        tableros != null ? Number(tableros) : null,
-        parales != null ? Number(parales) : null,
-        venta != null ? Number(venta) : null,
-      ]
-    );
-    res.json({ ok: true, datos: { creado: true } });
+    const conn = await pool.getConnection();
+
+    try {
+      await conn.beginTransaction();
+
+      // 1) Restar stock SOLO aquí (evita negativos)
+      const [upd] = await conn.query(
+        `UPDATE inventario
+           SET stock_inicial = stock_inicial - ?
+         WHERE id_producto = ? AND stock_inicial >= ?`,
+        [qty, idNum, qty]
+      );
+      if (upd.affectedRows === 0) {
+        await conn.rollback();
+        return res.status(409).json({
+          ok: false,
+          error: `Stock insuficiente o producto inexistente (id=${idNum})`,
+        });
+      }
+
+      // 2) Tomar nombre y stock restante
+      const [[prod]] = await conn.query(
+        `SELECT nombre_producto, stock_inicial
+           FROM inventario
+          WHERE id_producto = ?`,
+        [idNum]
+      );
+      const nombre = prod?.nombre_producto || "";
+      const stockRestante = Number(prod?.stock_inicial ?? 0);
+
+      // 3) Insertar consumo
+      const [ins] = await conn.query(
+        `INSERT INTO consumo_taller
+           (fecha, id_producto, producto, cantidad, valor, tableros, parales, venta)
+         VALUES (?,?,?,?,?,?,?,?)`,
+        [
+          fecha,
+          idNum,
+          nombre,
+          Number(qty),
+          Number(valor),
+          tableros,
+          parales,
+          venta,
+        ]
+      );
+
+      await conn.commit();
+      return res.json({
+        ok: true,
+        datos: {
+          creado: true,
+          id_consumo: ins.insertId,
+          stock_restante: stockRestante,
+        },
+      });
+    } catch (e) {
+      try {
+        await conn.rollback();
+      } catch {}
+      return res.status(500).json({ ok: false, error: e.message });
+    } finally {
+      conn.release();
+    }
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-app.delete("/api/consumo/:id", auth, async (req, res) => {
+app.put("/api/consumo/:id", auth, async (req, res) => {
+  const { fecha, id_producto, cantidad, valor, tableros, parales, venta } =
+    req.body || {};
+  const idNum = Number(id_producto);
+  const qtyNew = Number(cantidad);
+  const valNew = Number(valor);
+
+  if (
+    !fecha ||
+    !idNum ||
+    !Number.isFinite(qtyNew) ||
+    qtyNew <= 0 ||
+    !Number.isFinite(valNew)
+  ) {
+    return res.status(400).json({ ok: false, error: "Datos inválidos" });
+  }
+
+  const pool = await getPool();
+  const conn = await pool.getConnection();
   try {
-    const pool = await getPool();
-    const [r] = await pool.query("DELETE FROM consumo_taller WHERE id=?", [
+    await conn.beginTransaction();
+
+    // Traer consumo actual
+    const [[row]] = await conn.query(
+      "SELECT id, id_producto, cantidad FROM consumo_taller WHERE id=? FOR UPDATE",
+      [req.params.id]
+    );
+    if (!row) {
+      await conn.rollback();
+      return res.status(404).json({ ok: false, error: "No encontrado" });
+    }
+
+    if (Number(row.id_producto) !== idNum) {
+      await conn.rollback();
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          error: "No se permite cambiar el producto en edición",
+        });
+    }
+
+    const diff = qtyNew - Number(row.cantidad); // si aumenta consumo, diff>0 hay que RESTAR stock adicional
+    if (diff !== 0) {
+      if (diff > 0) {
+        // restar stock adicional si hay suficiente
+        const [upd] = await conn.query(
+          `UPDATE inventario SET stock_inicial = stock_inicial - ? WHERE id_producto=? AND stock_inicial >= ?`,
+          [diff, idNum, diff]
+        );
+        if (upd.affectedRows === 0) {
+          await conn.rollback();
+          return res
+            .status(409)
+            .json({
+              ok: false,
+              error: "Stock insuficiente para aumentar consumo",
+            });
+        }
+      } else {
+        // si diff<0, reponer (-diff)
+        await conn.query(
+          "UPDATE inventario SET stock_inicial = stock_inicial + ? WHERE id_producto=?",
+          [-diff, idNum]
+        );
+      }
+    }
+
+    // Actualizar fila
+    await conn.query(
+      `UPDATE consumo_taller
+          SET fecha=?, cantidad=?, valor=?, tableros=?, parales=?, venta=?
+        WHERE id=?`,
+      [
+        fecha,
+        qtyNew,
+        valNew,
+        tableros != null ? Number(tableros) : null,
+        parales != null ? Number(parales) : null,
+        venta != null ? Number(venta) : null,
+        req.params.id,
+      ]
+    );
+
+    await conn.commit();
+    res.json({ ok: true, datos: { actualizado: true } });
+  } catch (e) {
+    try {
+      await conn.rollback();
+    } catch {}
+    res.status(500).json({ ok: false, error: e.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// DELETE: borrar consumo (REPONER stock)
+app.delete("/api/consumo/:id", auth, async (req, res) => {
+  const pool = await getPool();
+  const conn = await pool.getConnection();
+
+  try {
+    await conn.beginTransaction();
+
+    // 1) Traer consumo (cantidad e id_producto)
+    const [[c]] = await conn.query(
+      "SELECT id, id_producto, cantidad FROM consumo_taller WHERE id = ? FOR UPDATE",
+      [req.params.id]
+    );
+    if (!c) {
+      await conn.rollback();
+      return res.status(404).json({ ok: false, error: "No encontrado" });
+    }
+
+    // 2) Reponer stock
+    await conn.query(
+      "UPDATE inventario SET stock_inicial = stock_inicial + ? WHERE id_producto = ?",
+      [Number(c.cantidad) || 0, Number(c.id_producto)]
+    );
+
+    // 3) Borrar consumo
+    const [del] = await conn.query("DELETE FROM consumo_taller WHERE id = ?", [
       req.params.id,
     ]);
-    if (!r.affectedRows)
+    if (del.affectedRows === 0) {
+      await conn.rollback();
       return res.status(404).json({ ok: false, error: "No encontrado" });
-    res.json({ ok: true, datos: { id: Number(req.params.id) } });
+    }
+
+    await conn.commit();
+    return res.json({ ok: true, datos: { id: Number(req.params.id) } });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    try {
+      await conn.rollback();
+    } catch {}
+    return res.status(500).json({ ok: false, error: e.message });
+  } finally {
+    conn.release();
   }
 });
 
